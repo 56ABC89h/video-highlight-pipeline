@@ -175,12 +175,16 @@ def create_highlight_clip(
     highlights: List[Tuple[float, float]],
     out_path: str
 ):
-    with VideoFileClip(source_video) as vid:
-        clips = [
-            vid.subclip(s, e)
-            for s, e in highlights
-            if e - s >= MIN_HIGHLIGHT_LENGTH
-        ]
+    with VideoFileClip(source_video) as clips = [
+    vid.subclipped(s, e)
+    for s, e in highlights
+    if e - s >= MIN_HIGHLIGHT_LENGTH
+]
+
+            
+            
+            
+        
 
         if not clips:
             logger.warning("Keine gültigen Highlight-Clips")
