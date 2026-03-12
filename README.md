@@ -42,7 +42,7 @@ WINDOW_SIZE = 0.5
 THRESHOLD_FACTOR = 1.3
 
 # YouTube Kanal
-CHANNEL_URL = "https://www.youtube.com/@CHANNELNAME/videos"
+CHANNEL_URL = "CHANNEL_URL = "https://www.youtube.com/@mkbhd/videos"
 
 # wie oft der Kanal geprüft wird (Sekunden)
 CHECK_INTERVAL = 300
