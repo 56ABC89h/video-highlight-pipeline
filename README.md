@@ -1,260 +1,347 @@
- os
-import sys
+import time
 import shutil
-import logging
 import tempfile
-import argparse
+import logging
+import subprocess
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple
 
-print("=== PROGRAMMSTART ===", flush=True)
+import numpy as np
+import yt_dlp
 
-# -------------------------
-# Logging
-# -------------------------
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
+from moviepy import VideoFileClip, concatenate_videoclips
+
+
+# =========================
+# LOGGING
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-logger = logging.getLogger("AutoPipeline")
+logger = logging.getLogger("ShortsBot")
 
-# -------------------------
-# Optional Imports
-# -------------------------
-try:
-    import whisper
-except Exception:
-    whisper = None
+print("=== PROGRAMMSTART ===", flush=True)
 
-try:
-    import cv2
-except Exception:
-    cv2 = None
 
-try:
-    from deepface import DeepFace
-except Exception:
-    DeepFace = None
+# =========================
+# PARAMETER
+# =========================
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
 
-try:
-    from moviepy.editor import VideoFileClip, concatenate_videoclips
-except Exception as e:
-    print("Fehler beim Importieren von moviepy:", e)
-    sys.exit(1)
+TARGET_WIDTH = 1080
+TARGET_HEIGHT = 1920
 
-# -------------------------
-# Parameter
-# -------------------------
-HIGHLIGHT_PRE_PADDING = 1.0
-HIGHLIGHT_POST_PADDING = 2.0
-MIN_HIGHLIGHT_LENGTH = 1.0
-EMOTION_CONF_THRESHOLD = 0.5
-FACE_FRAME_SKIP = 5
+MIN_HIGHLIGHT_LENGTH = 5.0
+MAX_HIGHLIGHT_LENGTH = 30.0
 
-# -------------------------
-# FFmpeg Check
-# -------------------------
-def ensure_ffmpeg_available():
-    import subprocess
+WINDOW_SIZE = 0.5
+THRESHOLD_FACTOR = 1.3
 
-    try:
-        subprocess.run(
-            ["ffmpeg", "-version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=True
-        )
-        logger.info("FFmpeg über Systempfad verfügbar")
-        return
-    except Exception:
-        pass
+# YouTube Kanal
+CHANNEL_URL = "https://www.youtube.com/@CHANNELNAME/videos"
 
-    ffmpeg_folder = Path(r"C:\Users\Computer\AppData\Local\Microsoft\WinGet\Links")
-    ffmpeg_exe = ffmpeg_folder / "ffmpeg.exe"
-    ffprobe_exe = ffmpeg_folder / "ffprobe.exe"
+# wie oft der Kanal geprüft wird (Sekunden)
+CHECK_INTERVAL = 300
 
-    if ffmpeg_exe.exists() and ffprobe_exe.exists():
-        os.environ["FFMPEG_BINARY"] = str(ffmpeg_exe)
-        os.environ["FFPROBE_BINARY"] = str(ffprobe_exe)
-        logger.info(f"FFmpeg lokal gefunden: {ffmpeg_exe}")
-        return
 
-    raise RuntimeError("FFmpeg nicht gefunden (Systempfad oder WinGet)")
+# =========================
+# YOUTUBE DOWNLOAD
+# =========================
+def download_channel_videos(channel_url: str, input_dir: Path):
 
-# -------------------------
-# Whisper
-# -------------------------
-def transcribe_with_local_whisper(
-    video_path: str,
-    model_size: str = "small"
-) -> Dict[str, Any]:
-    if whisper is None:
-        raise RuntimeError("whisper ist nicht installiert")
+    ydl_opts = {
+        "outtmpl": str(input_dir / "%(title)s.%(ext)s"),
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "download_archive": "downloaded.txt",
+        "quiet": True
+    }
 
-    logger.info("Lade Whisper-Modell (%s)", model_size)
-    model = whisper.load_model(model_size)
-    result = model.transcribe(video_path)
-    logger.info("Whisper-Transkription abgeschlossen")
-    return result
+    logger.info("Prüfe YouTube Kanal auf neue Videos...")
 
-# -------------------------
-# Emotion Detection
-# -------------------------
-def detect_emotion_segments(video_path: str) -> List[Tuple[float, float]]:
-    if cv2 is None or DeepFace is None:
-        logger.warning("Emotionserkennung deaktiviert")
-        return []
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([channel_url])
 
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
+    logger.info("Download abgeschlossen")
 
-    segments = []
-    frame_index = 0
-    last_hit_time = None
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+# =========================
+# VIDEO NORMALISIERUNG
+# =========================
+def normalize_video(input_path: str) -> str:
 
-        if frame_index % FACE_FRAME_SKIP == 0:
-            t = frame_index / fps
-            try:
-                analysis = DeepFace.analyze(
-                    frame,
-                    actions=["emotion"],
-                    enforce_detection=False
-                )
-                if isinstance(analysis, list):
-                    analysis = analysis[0]
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        normalized_path = tmp.name
 
-                emotions = analysis.get("emotion", {})
-                if emotions and max(emotions.values()) >= EMOTION_CONF_THRESHOLD:
-                    if last_hit_time is None or t - last_hit_time > 1.0:
-                        segments.append((
-                            max(0, t - HIGHLIGHT_PRE_PADDING),
-                            min(duration, t + HIGHLIGHT_POST_PADDING)
-                        ))
-                    last_hit_time = t
-            except Exception:
-                pass
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i", input_path,
+        "-vf", "fps=30",
+        "-vsync", "cfr",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-c:a", "aac",
+        "-ar", "48000",
+        normalized_path
+    ]
 
-        frame_index += 1
+    logger.info("Normalisiere Video (CFR + 48kHz Audio)")
 
-    cap.release()
-    return merge_close_segments(segments)
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-# -------------------------
-# Segment Merge
-# -------------------------
-def merge_close_segments(
-    segments: List[Tuple[float, float]],
-    gap: float = 1.0
-) -> List[Tuple[float, float]]:
-    if not segments:
-        return []
+    return normalized_path
 
-    segments.sort()
-    merged = [segments[0]]
 
-    for s, e in segments[1:]:
-        last_s, last_e = merged[-1]
-        if s <= last_e + gap:
-            merged[-1] = (last_s, max(last_e, e))
-        else:
-            merged.append((s, e))
+# =========================
+# AUDIO HIGHLIGHT ANALYSE
+# =========================
+def detect_audio_highlights(video_path: str) -> List[Tuple[float, float]]:
+    highlights = []
 
-    return merged
+    with VideoFileClip(video_path) as clip:
 
-# -------------------------
-# Video Creation
-# -------------------------
+        if clip.audio is None:
+            logger.warning("Kein Audio – keine Analyse möglich")
+            return []
+
+        audio = clip.audio.to_soundarray()
+        audio = audio.mean(axis=1)
+
+        audio_fps = clip.audio.fps
+        step = int(WINDOW_SIZE * audio_fps)
+
+        volumes = []
+        times = []
+
+        for i in range(0, len(audio), step):
+
+            window = audio[i:i + step]
+
+            if len(window) == 0:
+                continue
+
+            rms = np.sqrt(np.mean(window ** 2))
+
+            volumes.append(rms)
+            times.append(i / audio_fps)
+
+        if not volumes:
+            return []
+
+        threshold = np.mean(volumes) * THRESHOLD_FACTOR
+
+        active = False
+        start = 0.0
+
+        for t, v in zip(times, volumes):
+
+            if v >= threshold and not active:
+                active = True
+                start = t
+
+            elif v < threshold and active:
+
+                end = t
+                duration = end - start
+
+                if MIN_HIGHLIGHT_LENGTH <= duration <= MAX_HIGHLIGHT_LENGTH:
+                    highlights.append((start, end))
+
+                active = False
+
+        if active:
+
+            end = clip.duration
+            duration = end - start
+
+            if MIN_HIGHLIGHT_LENGTH <= duration <= MAX_HIGHLIGHT_LENGTH:
+                highlights.append((start, end))
+
+    logger.info("Audio-Highlights erkannt: %d", len(highlights))
+
+    return highlights
+
+
+# =========================
+# SHORTS FORMAT
+# =========================
+def to_shorts_format(clip: VideoFileClip) -> VideoFileClip:
+
+    w, h = clip.size
+    target_ratio = 9 / 16
+    current_ratio = w / h
+
+    if current_ratio > target_ratio:
+
+        new_width = int(h * target_ratio)
+        x1 = (w - new_width) // 2
+
+        clip = clip.cropped(x1=x1, width=new_width)
+
+    elif current_ratio < target_ratio:
+
+        new_height = int(w / target_ratio)
+        y1 = (h - new_height) // 2
+
+        clip = clip.cropped(y1=y1, height=new_height)
+
+    return clip.resized((1080, 1920))
+
+
+# =========================
+# HIGHLIGHT CLIP ERSTELLEN
+# =========================
 def create_highlight_clip(
     source_video: str,
     highlights: List[Tuple[float, float]],
     out_path: str
 ):
-    with VideoFileClip(source_video) as clips = [
-    vid.subclipped(s, e)
-    for s, e in highlights
-    if e - s >= MIN_HIGHLIGHT_LENGTH
-]
 
-            
-            
-            
-        
+    logger.info("Erstelle Highlight-Clip")
 
-        if not clips:
-            logger.warning("Keine gültigen Highlight-Clips")
+    processed_clips = []
+
+    with VideoFileClip(source_video) as video:
+
+        for start, end in highlights:
+
+            if end - start < MIN_HIGHLIGHT_LENGTH:
+                continue
+
+            sub = video.subclip(start, end)
+            sub = to_shorts_format(sub)
+
+            processed_clips.append(sub)
+
+        if not processed_clips:
+            logger.warning("Keine gültigen Clips → Abbruch")
             return
 
-        final = concatenate_videoclips(clips, method="compose")
+        final = concatenate_videoclips(processed_clips, method="compose")
 
-        with tempfile.NamedTemporaryFile(
-            suffix=".mp4",
-            delete=False
-        ) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
             tmp_path = tmp.name
 
         final.write_videofile(
             tmp_path,
             codec="libx264",
             audio_codec="aac",
-            fps=vid.fps
+            fps=30,
+            audio_fps=48000,
+            threads=4,
+            ffmpeg_params=["-async", "1"]
         )
 
         final.close()
-        shutil.move(tmp_path, out_path)
 
-# -------------------------
-# File Processing
-# -------------------------
-def process_one_file(file_path: Path, out_folder: Path):
-    logger.info("Verarbeite: %s", file_path)
+    shutil.move(tmp_path, out_path)
+
+    logger.info("Gespeichert: %s", out_path)
+
+
+# =========================
+# VIDEO VERARBEITEN
+# =========================
+def process_video(video_path: Path, output_dir: Path):
+
+    logger.info("Verarbeite: %s", video_path.name)
+
+    normalized_video = normalize_video(str(video_path))
+
+    highlights = detect_audio_highlights(normalized_video)
+
+    if not highlights:
+
+        logger.warning("Fallback aktiv: erste 10 Sekunden")
+
+        with VideoFileClip(normalized_video) as clip:
+            end = min(10, clip.duration)
+
+        highlights = [(0, end)]
+
+    out_file = output_dir / f"{video_path.stem}_shorts.mp4"
+
+    create_highlight_clip(
+        normalized_video,
+        highlights,
+        str(out_file)
+    )
 
     try:
-        emotion_segments = detect_emotion_segments(str(file_path))
+        Path(normalized_video).unlink()
+    except:
+        pass
 
-        if emotion_segments:
-            highlights = emotion_segments
-        else:
-            logger.warning("Keine Emotionen erkannt – Fallback")
-            with VideoFileClip(str(file_path)) as v:
-                highlights = [(0, min(10, v.duration))]
 
-        out_folder.mkdir(parents=True, exist_ok=True)
-        out_video = out_folder / f"{file_path.stem}_highlight.mp4"
+# =========================
+# WATCHDOG
+# =========================
+class VideoHandler(FileSystemEventHandler):
 
-        create_highlight_clip(
-            str(file_path),
-            highlights,
-            str(out_video)
-        )
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
 
-        logger.info("Fertig: %s", out_video)
+    def on_created(self, event):
 
-    except Exception:
-        logger.exception("Fehler bei %s", file_path)
+        if event.is_directory:
+            return
 
-# -------------------------
-# Main
-# -------------------------
+        path = Path(event.src_path)
+
+        if path.suffix.lower() in VIDEO_EXTENSIONS:
+
+            logger.info("Neue Datei erkannt: %s", path.name)
+
+            time.sleep(2)
+
+            process_video(path, self.output_dir)
+
+
+# =========================
+# MAIN
+# =========================
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--watch-folder", required=True)
-    parser.add_argument("--out-folder", required=True)
-    args = parser.parse_args()
 
-    ensure_ffmpeg_available()
+    input_dir = Path("input")
+    output_dir = Path("output")
 
-    watch = Path(args.watch_folder)
-    out = Path(args.out_folder)
+    input_dir.mkdir(exist_ok=True)
+    output_dir.mkdir(exist_ok=True)
 
-    for file in watch.iterdir():
-        if file.suffix.lower() in (".mp4", ".mkv", ".mov"):
-            process_one_file(file, out)
+    logger.info("Input:  %s", input_dir.resolve())
+    logger.info("Output: %s", output_dir.resolve())
+
+    observer = Observer()
+
+    observer.schedule(
+        VideoHandler(output_dir),
+        str(input_dir),
+        recursive=False
+    )
+
+    observer.start()
+
+    logger.info("Bot läuft und überwacht Kanal...")
+
+    try:
+
+        while True:
+
+            download_channel_videos(CHANNEL_URL, input_dir)
+
+            time.sleep(CHECK_INTERVAL)
+
+    except KeyboardInterrupt:
+
+        observer.stop()
+
+    observer.join()
+
 
 if __name__ == "__main__":
     main()
