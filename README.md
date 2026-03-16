@@ -14,6 +14,43 @@ from watchdog.events import FileSystemEventHandler
 
 from moviepy import VideoFileClip, concatenate_videoclips
 
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+
+def upload_video(video_path, title):
+
+    flow = InstalledAppFlow.from_client_secrets_file(
+        "client_secret.json",
+        SCOPES
+    )
+
+    credentials = flow.run_local_server(port=0)
+
+    youtube = build("youtube", "v3", credentials=credentials)
+
+    request = youtube.videos().insert(
+        part="snippet,status",
+        body={
+            "snippet": {
+                "title": title,
+                "description": "Auto generated short",
+                "tags": ["shorts"],
+                "categoryId": "22"
+            },
+            "status": {
+                "privacyStatus": "private"
+            }
+        },
+        media_body=MediaFileUpload(video_path)
+    )
+
+    request.execute()
+
+    print("Video hochgeladen") 
+
 
 # =========================
 # LOGGING
@@ -241,7 +278,12 @@ def create_highlight_clip(
 
     shutil.move(tmp_path, out_path)
 
-    logger.info("Gespeichert: %s", out_path)
+logger.info("Gespeichert: %s", out_path)
+
+# Upload starten
+upload_video(out_path, Path(out_path).stem)
+
+    
 
 
 # =========================
